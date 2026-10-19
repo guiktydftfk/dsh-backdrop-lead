@@ -75,6 +75,17 @@ node tools\backdrop-versions.cjs rollback 1  # 回到上一版
 | 0.1.1 | 自检新增 `strip` 计数 |
 | 0.1.0 | 基线：宿主+整视口绘制、测量式清理、侧边栏清扫、自检报告 |
 
+## 许可协议
+
+本项目支持 **CC BY-NC 4.0** 协议（Creative Commons Attribution-NonCommercial 4.0 International，署名—非商业性使用 4.0 国际）。
+
+- 允许：复制、分发、修改，用于非商业用途
+- 要求：署名（保留本项目名称与出处）
+- 禁止：商业性使用
+
+协议全文见 <https://creativecommons.org/licenses/by-nc/4.0/>
+
+
 ## 免责
 
 本地个人使用插件，未经发布审核。修改 profile 前建议先备份 `package.json`。
