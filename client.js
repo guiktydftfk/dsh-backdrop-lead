@@ -19,7 +19,10 @@ window.__ModuleLoader__.load({
     const STYLE_ID = 'dsh-backdrop-lead';
     const CONTROLS_WRITE_DELAY = 250;
 
-    const DEFAULTS = { image: '', maskOpacity: 0.35, blur: 0 };
+    const DEFAULTS = { image: '', maskOpacity: 0.35, blur: 0, composerOpaque: true, fit: 'cover' };
+    // How the artwork fills the window. `cover` fills without gaps, `contain`
+    // shows the whole picture (letterboxed), `tile` repeats it at natural size.
+    const FIT_MODES = ['cover', 'contain', 'tile'];
     // A full-screen 40px blur turns any photo into a flat wash, which reads as
     // "the background is gone". 24px is still a strong soft focus while keeping
     // the image recognisable; stored values above it are clamped on load.
@@ -84,6 +87,8 @@ window.__ModuleLoader__.load({
         maskOpacityHint: 'Dims the image behind the interface. 0% shows it at full strength.',
         blur: 'Blur',
         blurHint: 'Softens the image behind the interface.',
+        composerOpaque: 'Solid input box',
+        composerOpaqueHint: 'The chat input keeps its own solid background instead of showing the image through it.',
         errRead: 'That file could not be read as an image.',
         errQuota: 'Not enough browser storage for this image. Try a smaller one.',
         errWrite: 'The background could not be saved.',
@@ -98,6 +103,14 @@ window.__ModuleLoader__.load({
         diagFilter: 'Resolved filter',
         diagProbeBtn: 'Probe what covers the artwork',
         diagReportBtn: 'Self-check report',
+        diagCopyBtn: 'Copy self-check report',
+        diagCopied: 'Copied to clipboard',
+        diagCopyFailed: 'Copy failed — select the text below instead',
+        fit: 'Image fit',
+        fitHint: 'Cover fills the window, contain shows the whole picture, tile repeats it.',
+        fit_cover: 'Cover',
+        fit_contain: 'Contain',
+        fit_tile: 'Tile',
         diagHost: 'Artwork host',
         diagMissing: 'not set',
         diagMounted: 'mounted',
@@ -118,6 +131,8 @@ window.__ModuleLoader__.load({
         maskOpacityHint: '压暗界面背后的图片，0% 时图片最清晰。',
         blur: '模糊度',
         blurHint: '柔化界面背后的图片。',
+        composerOpaque: '输入框实心不透明',
+        composerOpaqueHint: '对话输入框使用自己的实心底色，不再透出背景图片。',
         errRead: '无法把这个文件读成图片。',
         errQuota: '浏览器存储空间不足，请换一张更小的图片。',
         errWrite: '背景保存失败。',
@@ -132,6 +147,14 @@ window.__ModuleLoader__.load({
         diagFilter: '实际 filter',
         diagProbeBtn: '探测遮挡元素',
         diagReportBtn: '导出自检报告',
+        diagCopyBtn: '复制自检报告',
+        diagCopied: '已复制到剪贴板',
+        diagCopyFailed: '复制失败，请手动选中下方文本',
+        fit: '图片适应方式',
+        fitHint: '铺满＝填满窗口可能裁剪；完整＝显示整张图；平铺＝按原尺寸重复。',
+        fit_cover: '铺满',
+        fit_contain: '完整',
+        fit_tile: '平铺',
         diagHost: '背景宿主',
         diagMissing: '未设置',
         diagMounted: '已挂载',
@@ -204,6 +227,32 @@ window.__ModuleLoader__.load({
     let imageObjectUrl = null;
     let imageObjectUrlKey = null;
 
+    /**
+     * Retired object URLs are revoked later, not immediately.
+     *
+     * The layer and the host background are painted by two different code paths.
+     * Revoking a URL the moment a new one is created could leave the other path
+     * holding a revoked URL — it then keeps showing the previously decoded frame,
+     * which looks exactly like "the old picture is stuck under the new one".
+     */
+    const retiredObjectUrls = [];
+    const RETIRED_URL_DELAY = 15000;
+
+    function retireObjectUrl(url) {
+      if (!url) return;
+      retiredObjectUrls.push(url);
+      if (typeof window === 'undefined' || typeof window.setTimeout !== 'function') return;
+      window.setTimeout(() => {
+        const index = retiredObjectUrls.indexOf(url);
+        if (index >= 0) retiredObjectUrls.splice(index, 1);
+        try {
+          if (typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url);
+        } catch (error) {
+          // best-effort cleanup
+        }
+      }, RETIRED_URL_DELAY);
+    }
+
     function imageUrl(dataUrl) {
       if (typeof dataUrl !== 'string' || dataUrl === '') return '';
       if (dataUrl === imageObjectUrlKey) return imageObjectUrl;
@@ -224,13 +273,7 @@ window.__ModuleLoader__.load({
         const previous = imageObjectUrl;
         imageObjectUrl = next;
         imageObjectUrlKey = dataUrl;
-        if (previous) {
-          try {
-            URL.revokeObjectURL(previous);
-          } catch (error) {
-            // The old URL is best-effort cleanup only.
-          }
-        }
+        if (previous) retireObjectUrl(previous);
         return next;
       } catch (error) {
         // Fall back to the data URL: correctness over speed.
@@ -333,24 +376,35 @@ window.__ModuleLoader__.load({
       const mask = withAlpha(sampled || baseRgb(), snapshot.maskOpacity);
       // The exact background value being painted, shared by every target.
       let paintedBackground = '';
+      // Resolved fit mode for this paint pass (guarded in case of a bad value).
+      const paintedFit = FIT_MODES.indexOf(String(snapshot.fit)) !== -1 ? String(snapshot.fit) : DEFAULTS.fit;
       // Paint with `!important`: the surface-clearing pass writes
       // `background-image: none !important` on document roots, and a plain
       // assignment would lose to it, leaving `img=none` while claiming success.
-      const paintElement = (node) => {
+      // With `contain` the letterboxed margin must be the theme base colour, not
+      // the window's black: the document roots get an opaque fill, the host stays
+      // transparent so it shows that fill instead of stacking another copy.
+      const solidBase = 'rgb(' + (sampled || baseRgb()).join(', ') + ')';
+      const paintElement = (node, isRoot) => {
         if (!node || !node.style) return;
+        const size = paintedFit === 'contain'
+          ? 'contain, contain'
+          : (paintedFit === 'tile' ? 'auto, auto' : 'cover, cover');
+        const repeat = paintedFit === 'tile' ? 'repeat, repeat' : 'no-repeat, no-repeat';
+        const color = paintedFit === 'contain' && isRoot === true ? solidBase : 'transparent';
         try {
           if (typeof node.style.setProperty === 'function') {
             node.style.setProperty('background-image', paintedBackground, 'important');
-            node.style.setProperty('background-size', 'cover, cover', 'important');
+            node.style.setProperty('background-size', size, 'important');
             node.style.setProperty('background-position', 'center center, center center', 'important');
-            node.style.setProperty('background-repeat', 'no-repeat, no-repeat', 'important');
-            node.style.setProperty('background-color', 'transparent', 'important');
+            node.style.setProperty('background-repeat', repeat, 'important');
+            node.style.setProperty('background-color', color, 'important');
           } else {
             node.style.backgroundImage = paintedBackground;
-            node.style.backgroundSize = 'cover, cover';
+            node.style.backgroundSize = size;
             node.style.backgroundPosition = 'center center, center center';
-            node.style.backgroundRepeat = 'no-repeat, no-repeat';
-            node.style.backgroundColor = 'transparent';
+            node.style.backgroundRepeat = repeat;
+            node.style.backgroundColor = color;
           }
         } catch (error) {
           // A locked-down element keeps its own paint.
@@ -358,16 +412,46 @@ window.__ModuleLoader__.load({
       };
       const applyBackground = (url) => {
         paintedBackground = 'linear-gradient(' + mask + ', ' + mask + '), url("' + url + '")';
+        // The app shell can swap the host element mid-session (React re-render).
+        // The previous host would keep its old picture forever, which reads as
+        // "the old image is stuck under the new one" — so wipe it first.
+        if (paintedHost && paintedHost !== host) resetHostElement(paintedHost);
+        // Belt and braces: any other element still marked as a painted host is
+        // stale, so take the artwork off it as well.
+        try {
+          const marked = document.querySelectorAll ? document.querySelectorAll('[' + HOST_ATTR + ']') : [];
+          for (const candidate of marked) {
+            if (candidate !== host) resetHostElement(candidate);
+          }
+        } catch (error) {
+          // ignore: selector unsupported
+        }
         try {
           paintedHost = host;
           host.setAttribute(HOST_ATTR, '');
           paintElement(host);
           diagnostics.hostBg = String(mask) + ' + image';
+          diagnostics.fit = paintedFit;
+          paintStats.hostToken = imageToken(snapshot.image);
           diagnostics.hostLabel = String(host.tagName || '').toLowerCase()
             + (host.id ? '#' + host.id : '')
             + (typeof host.className === 'string' && host.className ? '.' + host.className.split(' ')[0] : '');
+          recordTarget(host, 'host ' + diagnostics.hostLabel, paintStats.hostToken);
         } catch (error) {
           diagnostics.hostBg = 'write failed';
+        }
+        // Any other element still marked as a host holds a picture from an earlier
+        // paint (the shell swapped the host element). Take the artwork off it so a
+        // stale frame can never show under the current one.
+        try {
+          const marked = document.querySelectorAll ? document.querySelectorAll('[' + HOST_ATTR + ']') : [];
+          for (const candidate of marked) {
+            if (candidate === host) continue;
+            resetHostElement(candidate);
+            recordTarget(candidate, 'stale host', 'cleared');
+          }
+        } catch (error) {
+          // ignore: selector unsupported
         }
         // Also cover the whole viewport. The host box does not always reach the
         // window edges, and a transparent document would show the window's own
@@ -382,7 +466,7 @@ window.__ModuleLoader__.load({
                 color: root.style.getPropertyValue ? root.style.getPropertyValue('background-color') : '',
               });
             }
-            paintElement(root);
+            paintElement(root, true);
           } catch (error) {
             // A locked-down root keeps its own paint.
           }
@@ -397,22 +481,25 @@ window.__ModuleLoader__.load({
       return true;
     }
 
+    /** Remove every trace of the artwork from one host element. */
+    function resetHostElement(host) {
+      if (!host) return;
+      try {
+        if (host.removeAttribute) host.removeAttribute(HOST_ATTR);
+        if (!host.style) return;
+        host.style.backgroundImage = '';
+        host.style.backgroundSize = '';
+        host.style.backgroundPosition = '';
+        host.style.backgroundRepeat = '';
+        if (host.style.removeProperty) host.style.removeProperty('background-color');
+      } catch (error) {
+        // ignore: element already detached
+      }
+    }
+
     function clearHost() {
       if (typeof document === 'undefined') return;
-      const remember = (host) => {
-        if (!host) return;
-        try {
-          if (host.removeAttribute) host.removeAttribute(HOST_ATTR);
-          if (!host.style) return;
-          host.style.backgroundImage = '';
-          host.style.backgroundSize = '';
-          host.style.backgroundPosition = '';
-          host.style.backgroundRepeat = '';
-          if (host.style.removeProperty) host.style.removeProperty('background-color');
-        } catch (error) {
-          // ignore: element already detached
-        }
-      };
+      const remember = resetHostElement;
       // Prefer the element we actually painted.
       remember(paintedHost);
       paintedHost = null;
@@ -452,6 +539,111 @@ window.__ModuleLoader__.load({
         ? document.body.hasAttribute('data-ds-dark-theme')
         : false;
       return dark ? [16, 22, 42] : [255, 255, 255];
+    }
+
+    /**
+     * Copy text to the clipboard, with a textarea fallback for pages where the
+     * async clipboard API is unavailable (or refuses without a user gesture).
+     */
+    function copyText(text) {
+      const value = String(text === null || text === undefined ? '' : text);
+      const fallback = () => {
+        if (typeof document === 'undefined' || !document.body || !document.createElement) {
+          return Promise.reject(new Error('clipboard unavailable'));
+        }
+        return new Promise((resolve, reject) => {
+          try {
+            const area = document.createElement('textarea');
+            area.value = value;
+            area.setAttribute('readonly', '');
+            area.style.position = 'fixed';
+            area.style.top = '-1000px';
+            area.style.opacity = '0';
+            document.body.appendChild(area);
+            if (area.select) area.select();
+            const copied = typeof document.execCommand === 'function' && document.execCommand('copy');
+            if (area.remove) area.remove();
+            else if (area.parentNode) area.parentNode.removeChild(area);
+            if (copied) resolve();
+            else reject(new Error('copy rejected'));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      };
+      if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        return navigator.clipboard.writeText(value).catch(fallback);
+      }
+      return Promise.resolve().then(fallback);
+    }
+
+    /**
+     * Short token for an image payload, so the self-check can prove whether the
+     * desktop repainted with the *new* picture after an upload.
+     */
+    function imageToken(text) {
+      const value = String(text || '');
+      if (value === '') return 'none';
+      let hash = 2166136261;
+      for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }
+      return (hash >>> 0).toString(16).slice(0, 8) + ':' + value.length;
+    }
+
+    /** Repaint hook, wired by apply() so uploads can force a fresh paint. */
+    let requestRepaint = () => {};
+    const paintStats = { paints: 0, paintToken: 'none', hostToken: 'none', targets: [] };
+
+    /** Record which element received which picture, for the self-check. */
+    function recordTarget(node, label, token) {
+      if (!node) return;
+      for (const entry of paintStats.targets) {
+        if (entry.node === node) {
+          entry.label = label;
+          entry.token = token;
+          return;
+        }
+      }
+      paintStats.targets.push({ node, label, token });
+      if (paintStats.targets.length > 8) paintStats.targets.shift();
+    }
+
+    /** Human-readable list of painted targets, newest picture first. */
+    function describeTargets() {
+      return paintStats.targets.map((entry) => entry.label + '=' + entry.token).join(' | ');
+    }
+
+    /**
+     * Force the compositor to redraw an element.
+     *
+     * Writing the same background value twice is a no-op for the browser, so a
+     * repaint that happened while the element was covered (settings dialog open)
+     * can leave the layer stale until something else touches it. A momentary
+     * floating-point opacity change invalidates the layer without any visual
+     * difference.
+     */
+    function nudgeRepaint(node) {
+      if (!node || !node.style) return;
+      try {
+        const previous = node.style.opacity;
+        node.style.opacity = '0.999';
+        const restore = () => {
+          try {
+            node.style.opacity = previous === undefined ? '' : previous;
+          } catch (error) {
+            // element went away
+          }
+        };
+        if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(restore);
+        } else if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
+          window.setTimeout(restore, 16);
+        }
+      } catch (error) {
+        // best-effort
+      }
     }
 
     function readAsDataUrl(file) {
@@ -541,6 +733,10 @@ window.__ModuleLoader__.load({
           if (controls && typeof controls === 'object') {
             state.maskOpacity = clampNumber(controls.maskOpacity, DEFAULTS.maskOpacity, 0, 1);
             state.blur = clampNumber(controls.blur, DEFAULTS.blur, 0, MAX_BLUR);
+            if (typeof controls.composerOpaque === 'boolean') state.composerOpaque = controls.composerOpaque;
+            if (typeof controls.fit === 'string' && FIT_MODES.indexOf(controls.fit) !== -1) {
+              state.fit = controls.fit;
+            }
           }
         }
         const image = localStorage.getItem(STORE_IMAGE_KEY);
@@ -639,6 +835,8 @@ window.__ModuleLoader__.load({
             localStorage.setItem(STORE_CONTROLS_KEY, JSON.stringify({
               maskOpacity: self.state.maskOpacity,
               blur: self.state.blur,
+              composerOpaque: self.state.composerOpaque !== false,
+              fit: self.state.fit || DEFAULTS.fit,
             }));
           } catch (error) {
             // Slider durability is best-effort; the live value still applies.
@@ -656,7 +854,10 @@ window.__ModuleLoader__.load({
       this.state = next;
       this.emit();
       const failure = imageChanged ? this.writeImage(next.image) : null;
-      if (patch.maskOpacity !== undefined || patch.blur !== undefined) this.scheduleControlsPersist();
+      if (patch.maskOpacity !== undefined || patch.blur !== undefined
+        || patch.composerOpaque !== undefined || patch.fit !== undefined) {
+        this.scheduleControlsPersist();
+      }
       return failure;
     };
 
@@ -767,6 +968,13 @@ window.__ModuleLoader__.load({
           + ' token=' + (diagnostics.tokensActive ? '1' : '0') + ')');
         push('host element', diagnostics.hostFound ? diagnostics.hostLabel : 'NOT FOUND');
         push('host background', diagnostics.hostBg);
+        push('composer card', diagnostics.composer + ' (switch ' + (state.composerOpaque !== false ? 'on' : 'off') + ')');
+        push('image fit', state.fit || DEFAULTS.fit);
+        push('paints', paintStats.paints
+          + ' | paint ' + paintStats.paintToken
+          + ' | host ' + paintStats.hostToken
+          + ' | stored ' + imageToken(state.image));
+        push('paint targets', describeTargets() || 'none');
       } catch (error) {
         push('state', 'read failed: ' + String((error && error.message) || error));
       }
@@ -817,6 +1025,8 @@ window.__ModuleLoader__.load({
       sidebarMarked: 0,
       stripMarked: 0,
       barsMarked: 0,
+      composer: 'off',
+      fit: 'cover',
     };
 
     /**
@@ -943,6 +1153,8 @@ window.__ModuleLoader__.load({
         // Never clear an element the artwork is painted ON: its background-image
         // is the artwork, and a `none !important` here would erase it.
         if (element === paintedHost) return;
+        // The opaque composer card is an explicit user choice; keep its fill.
+        if (opaqueComposer && element === opaqueComposer.element) return;
         try {
           if (element.hasAttribute && element.hasAttribute(HOST_ATTR)) return;
         } catch (error) {
@@ -1317,6 +1529,12 @@ window.__ModuleLoader__.load({
         const barsMarked = markBottomGradientBars();
         // Anything that ended up inside an open dialog is given back immediately.
         const restoredFromDialog = restoreInsideDialogs();
+        // The composer switch is applied after every scrub pass: the card looks
+        // like a wide strip to the scrubbers, so it must be re-solided last.
+        const current = store.get();
+        if (current && current.composerOpaque !== false) {
+          markComposerOpaque();
+        }
         diagnostics.surfaces = found.length + measured + sidebarMarked + stripMarked + barsMarked - restoredFromDialog;
         diagnostics.measured = measured;
         diagnostics.sidebarMarked = sidebarMarked;
@@ -1474,6 +1692,101 @@ window.__ModuleLoader__.load({
         for (const saved of clearedSurfaces) restoreElement(saved);
         clearedSurfaces = [];
         diagnostics.surfaces = 0;
+        restoreOpaqueComposer();
+      }
+
+      // ---- opaque composer card ----------------------------------------------
+      // The chat composer inherits the translucent surface tokens, so the
+      // artwork shows through the input card. When the user wants a solid card,
+      // find the card by walking up from the text field and give it an opaque
+      // fill of the current base colour.
+      let opaqueComposer = null;
+
+      function findComposerCard() {
+        if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return null;
+        if (typeof window === 'undefined' || typeof window.getComputedStyle !== 'function') return null;
+        const viewportWidth = window.innerWidth || 1280;
+        const viewportHeight = window.innerHeight || 800;
+        let fields = [];
+        try {
+          fields = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'));
+        } catch (error) {
+          return null;
+        }
+        for (const field of fields) {
+          if (!field || !field.getBoundingClientRect) continue;
+          let fieldRect;
+          try {
+            fieldRect = field.getBoundingClientRect();
+          } catch (error) {
+            continue;
+          }
+          // Only the composer lives in the lower part of the window.
+          if (fieldRect.top < viewportHeight * 0.4) continue;
+          let node = field;
+          for (let depth = 0; depth < 10; depth += 1) {
+            node = node.parentElement;
+            if (!node || node === document.body || !node.getBoundingClientRect) break;
+            let rect;
+            try {
+              rect = node.getBoundingClientRect();
+            } catch (error) {
+              continue;
+            }
+            if (rect.width < viewportWidth * 0.3) continue;
+            if (rect.height < 44 || rect.height > 360) continue;
+            if (rect.bottom > viewportHeight + 8) continue;
+            return node;
+          }
+        }
+        return null;
+      }
+
+      function markComposerOpaque() {
+        const card = findComposerCard();
+        if (!card) {
+          diagnostics.composer = 'not found';
+          return 0;
+        }
+        if (opaqueComposer && opaqueComposer.element !== card) restoreOpaqueComposer();
+        if (opaqueComposer && opaqueComposer.element === card) {
+          diagnostics.composer = 'opaque';
+          return 1;
+        }
+        const inline = card.style;
+        if (!inline) return 0;
+        const rgb = baseRgb();
+        const solid = 'rgb(' + rgb[0] + ', ' + rgb[1] + ', ' + rgb[2] + ')';
+        opaqueComposer = {
+          element: card,
+          color: inline.backgroundColor || '',
+          image: inline.backgroundImage || '',
+        };
+        try {
+          inline.setProperty('background-color', solid, 'important');
+          inline.setProperty('background-image', 'none', 'important');
+          diagnostics.composer = 'opaque';
+        } catch (error) {
+          diagnostics.composer = 'write failed';
+        }
+        return 1;
+      }
+
+      function restoreOpaqueComposer() {
+        const saved = opaqueComposer;
+        opaqueComposer = null;
+        diagnostics.composer = 'off';
+        if (!saved || !saved.element) return;
+        try {
+          const inline = saved.element.style;
+          if (!inline) return;
+          if (saved.color) inline.setProperty('background-color', saved.color, 'important');
+          else inline.removeProperty('background-color');
+          if (saved.image) inline.setProperty('background-image', saved.image, 'important');
+          else inline.removeProperty('background-image');
+        } catch (error) {
+          // best-effort restore
+        }
       }
 
       function applyTokens() {
@@ -1498,6 +1811,15 @@ window.__ModuleLoader__.load({
       let watchedActive = false;
 
       return {
+        /** Turn the solid composer card on or off without re-running the scrubs. */
+        setComposerOpaque(enabled) {
+          try {
+            if (enabled) markComposerOpaque();
+            else restoreOpaqueComposer();
+          } catch (error) {
+            // best-effort: the toggle never breaks the rest of the surface pass
+          }
+        },
         setActive(active) {
           if (active) {
             if (!styleDisposer) styleDisposer = insertStyleTag();
@@ -1668,7 +1990,7 @@ window.__ModuleLoader__.load({
       let frame = null;
       let frameScheduled = false;
       // Last values actually written, so unchanged properties stay untouched.
-      const applied = { image: null, blur: null, mask: null, bleed: null };
+      const applied = { image: null, blur: null, mask: null, bleed: null, fit: null };
 
       function scheduleFrame() {
         if (frameScheduled) return;
@@ -1707,6 +2029,8 @@ window.__ModuleLoader__.load({
           return;
         }
         clearRetry();
+        paintStats.paints += 1;
+        paintStats.paintToken = imageToken(snapshot.image);
         const blur = snapshot.blur;
         // The blur samples outside the viewport edge; growing the media layer by
         // three times the radius hides the transparent fringe.
@@ -1725,10 +2049,20 @@ window.__ModuleLoader__.load({
         if (applied.image !== snapshot.image) {
           applied.image = snapshot.image;
           current.media.style.backgroundImage = 'url("' + imageUrl(snapshot.image) + '")';
+          recordTarget(current.media, 'layer', imageToken(snapshot.image));
         }
         if (applied.blur !== blur) {
           applied.blur = blur;
           current.media.style.filter = blur > 0 ? 'blur(' + blur + 'px)' : '';
+        }
+        // The layer must use the same fit as the host background. With `contain`
+        // and a mismatched cover, the layer showed a zoomed copy of the same
+        // picture around the letterboxed one — two overlapping images.
+        const fit = FIT_MODES.indexOf(String(snapshot.fit)) !== -1 ? String(snapshot.fit) : DEFAULTS.fit;
+        if (applied.fit !== fit) {
+          applied.fit = fit;
+          current.media.style.backgroundSize = fit === 'contain' ? 'contain' : (fit === 'tile' ? 'auto' : 'cover');
+          current.media.style.backgroundRepeat = fit === 'tile' ? 'repeat' : 'no-repeat';
         }
         const sampled = baseRgb();
         const mask = withAlpha(sampled, snapshot.maskOpacity);
@@ -1797,7 +2131,21 @@ window.__ModuleLoader__.load({
         diagnostics.mediaPx = 'n/a';
       }
 
-      return { render, teardown };
+      /**
+       * Forget what the last paint applied, so the next frame rewrites every
+       * property even if the snapshot looks unchanged. Used after an upload: the
+       * layer and the host background must never disagree about which picture is
+       * current, or the old frame shows through the new one.
+       */
+      function invalidate() {
+        applied.image = null;
+        applied.blur = null;
+        applied.mask = null;
+        applied.bleed = null;
+        applied.fit = null;
+      }
+
+      return { render, teardown, invalidate };
     }
 
     function Field(props) {
@@ -1882,6 +2230,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false);
       const [error, setError] = React.useState('');
       const [probeLines, setProbeLines] = React.useState([]);
+      const [copyState, setCopyState] = React.useState('');
 
       const pick = () => {
         if (inputRef.current) inputRef.current.click();
@@ -1916,6 +2265,7 @@ window.__ModuleLoader__.load({
             setError(t(failure));
           } else {
             lastUpload.phase = 'applied';
+            requestRepaint();
           }
         } catch (readError) {
           lastUpload.phase = 'read-failed';
@@ -1931,12 +2281,20 @@ window.__ModuleLoader__.load({
         setError('');
         const failure = store.set({ image: '' });
         if (failure) setError(t(failure));
+        else requestRepaint();
       };
 
       const reset = () => {
         setError('');
-        const failure = store.set({ image: '', maskOpacity: DEFAULTS.maskOpacity, blur: DEFAULTS.blur });
+        const failure = store.set({
+          image: '',
+          maskOpacity: DEFAULTS.maskOpacity,
+          blur: DEFAULTS.blur,
+          composerOpaque: DEFAULTS.composerOpaque,
+          fit: DEFAULTS.fit,
+        });
         if (failure) setError(t(failure));
+        else requestRepaint();
       };
 
       const hiddenInput = h('input', {
@@ -1981,7 +2339,8 @@ window.__ModuleLoader__.load({
                 bottom: -Math.ceil(previewBlur * 3) + 'px',
                 left: -Math.ceil(previewBlur * 3) + 'px',
                 backgroundImage: 'url("' + imageUrl(snapshot.image) + '")',
-                backgroundSize: 'cover',
+                backgroundSize: snapshot.fit === 'contain' ? 'contain' : (snapshot.fit === 'tile' ? 'auto' : 'cover'),
+                backgroundRepeat: snapshot.fit === 'tile' ? 'repeat' : 'no-repeat',
                 backgroundPosition: 'center',
                 filter: previewBlur > 0 ? 'blur(' + previewBlur + 'px)' : '',
               },
@@ -2073,6 +2432,67 @@ window.__ModuleLoader__.load({
           }),
         ),
         h(
+          'div',
+          { style: { marginTop: '4px', maxWidth: '420px' } },
+          h(
+            'span',
+            { style: { display: 'block', fontSize: '13px', color: 'var(--dsw-alias-label-primary)' } },
+            t('fit'),
+          ),
+          h(
+            'div',
+            { role: 'group', 'aria-label': t('fit'), style: { display: 'flex', gap: '8px', marginTop: '8px', flexWrap: 'wrap' } },
+            ...FIT_MODES.map((mode) => h(
+              Button,
+              {
+                key: mode,
+                onClick: () => store.set({ fit: mode }),
+                'aria-pressed': (snapshot.fit || DEFAULTS.fit) === mode,
+                style: (snapshot.fit || DEFAULTS.fit) === mode
+                  ? { outline: '2px solid var(--dsw-alias-border-active, var(--dsw-alias-label-primary))', outlineOffset: '1px' }
+                  : undefined,
+              },
+              t('fit_' + mode),
+            )),
+          ),
+          h(
+            'span',
+            { style: { display: 'block', marginTop: '6px', fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' } },
+            t('fitHint'),
+          ),
+        ),
+        h(
+          'label',
+          {
+            style: {
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: '10px',
+              marginTop: '18px',
+              maxWidth: '420px',
+              cursor: 'pointer',
+              fontSize: '13px',
+              color: 'var(--dsw-alias-label-primary)',
+            },
+          },
+          h('input', {
+            type: 'checkbox',
+            checked: snapshot.composerOpaque !== false,
+            onChange: (event) => store.set({ composerOpaque: !!event.target.checked }),
+            style: { marginTop: '2px', flex: 'none' },
+          }),
+          h(
+            'span',
+            null,
+            h('span', { style: { display: 'block' } }, t('composerOpaque')),
+            h(
+              'span',
+              { style: { display: 'block', marginTop: '2px', fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' } },
+              t('composerOpaqueHint'),
+            ),
+          ),
+        ),
+        h(
           'details',
           { open: true, style: { marginTop: '20px', maxWidth: '620px', fontSize: '12px' } },
           h(
@@ -2105,6 +2525,26 @@ window.__ModuleLoader__.load({
             'div',
             { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '10px' } },
             h(Button, { onClick: () => setProbeLines(buildSelfCheck()) }, t('diagReportBtn')),
+            h(
+              Button,
+              {
+                onClick: () => {
+                  const text = buildSelfCheck().join('\n');
+                  setProbeLines(text.split('\n'));
+                  copyText(text)
+                    .then(() => {
+                      setCopyState('ok');
+                      if (typeof window !== 'undefined' && window.setTimeout) {
+                        window.setTimeout(() => setCopyState(''), 2500);
+                      }
+                    })
+                    .catch(() => setCopyState('fail'));
+                },
+              },
+              t('diagCopyBtn'),
+            ),
+            copyState === 'ok' ? h('span', { role: 'status', style: { alignSelf: 'center', fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' } }, t('diagCopied')) : null,
+            copyState === 'fail' ? h('span', { role: 'status', style: { alignSelf: 'center', fontSize: '12px', color: 'var(--dsw-alias-state-error-primary)' } }, t('diagCopyFailed')) : null,
           ),
           probeLines.length > 0
             ? h(
@@ -2212,6 +2652,40 @@ window.__ModuleLoader__.load({
       const backdrop = createBackdropController();
       ctx.effect(() => () => surface.dispose(), 'dsh-backdrop-surface');
 
+      // Uploads must reach the desktop immediately. The painter normally reacts to
+      // the store, but a skipped frame would leave the old picture on screen until
+      // restart — so the upload path invalidates the paint state and repaints.
+      requestRepaint = () => {
+        const paintOnce = () => {
+          try {
+            const snapshot = store.get();
+            surface.setActive(snapshot.image !== '');
+            surface.setComposerOpaque(snapshot.composerOpaque !== false);
+            surface.refresh();
+            backdrop.invalidate();
+            backdrop.render(snapshot);
+            // Same-value background writes are no-ops; nudge the compositor so the
+            // layer really repaints even if it was covered when the image changed.
+            nudgeRepaint(findHostElement());
+            nudgeRepaint(document.body);
+            nudgeRepaint(document.documentElement);
+          } catch (error) {
+            // Never let a forced repaint break the caller (the upload already applied).
+          }
+        };
+        paintOnce();
+        // The upload happens while the settings dialog covers the desktop, and a
+        // background layer behind an open modal is repainted lazily — which is why
+        // the wallpaper only appeared after some unrelated DOM change (opening
+        // settings again, taking a screenshot). Re-assert for a little while so the
+        // new picture lands without any further interaction.
+        if (typeof window === 'undefined' || typeof window.setTimeout !== 'function') return;
+        for (const delay of [120, 500, 1500]) {
+          window.setTimeout(paintOnce, delay);
+        }
+      };
+      ctx.effect(() => () => { requestRepaint = () => {}; }, 'dsh-backdrop-repaint');
+
       // A palette switch changes the sampled surface colour and the mask colour;
       // rebuild the token layer and repaint the backdrop.
       ctx.effect(
@@ -2228,13 +2702,16 @@ window.__ModuleLoader__.load({
       const initial = store.get();
       let hadImage = initial.image !== '';
       surface.setActive(hadImage);
+      surface.setComposerOpaque(initial.composerOpaque !== false);
 
       ctx.effect(
         () =>
           store.subscribe(() => {
-            const active = store.get().image !== '';
+            const next = store.get();
+            const active = next.image !== '';
             if (active || hadImage) surface.setActive(active);
             hadImage = active;
+            surface.setComposerOpaque(next.composerOpaque !== false);
           }),
         'dsh-backdrop-surface-sync',
       );
